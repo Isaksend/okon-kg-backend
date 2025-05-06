@@ -10,7 +10,7 @@ const amoCRM = require('./amocrm-client');
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 9000;
 
 // Настройка логирования
 const logDir = path.join(__dirname, 'logs');
@@ -30,14 +30,24 @@ function log(message, type = 'info') {
 
 // Middleware
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || '*',
-    credentials: true
+    origin: [process.env.CORS_ORIGIN,'http://localhost:3000',  'https://okon.kg'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(bodyParser.json());
 
+app.get('/', (req, res) => {
+    log('Получен запрос к корневому маршруту');
+    res.send('Сервер работает');
+});
+
 // Логгирование запросов
 app.use((req, res, next) => {
-    log(`${req.method} ${req.path} - ${req.ip}`);
+    log(`${req.method} ${req.path} - IP: ${req.ip}`);
+    if (req.method === 'POST' || req.method === 'PUT') {
+        log(`Тело запроса: ${JSON.stringify(req.body)}`);
+    }
     next();
 });
 
@@ -71,8 +81,7 @@ app.post('/api/amocrm/lead', async (req, res) => {
         if (form_type) {
             fullComment += `Форма: ${form_type === 'desktop' ? 'Десктопная' : 'Мобильная'}\n`;
         }
-
-        // Добавляем комментарий пользователя (НЕ добавляем город повторно!)
+        // Добавляем комментарий пользователя
         if (comment) {
             fullComment += `Комментарий: ${comment}\n`;
         }
@@ -113,8 +122,7 @@ app.post('/api/amocrm/lead', async (req, res) => {
         });
     }
 });
-
 // Запуск сервера
-app.listen(PORT, () => {
-    log(`Сервер запущен на порту ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    log(`Сервер запущен на порту ${PORT} и доступен на всех интерфейсах`);
 });

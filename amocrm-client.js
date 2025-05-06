@@ -11,31 +11,84 @@ class AmoCRMClient {
         this.clientId = process.env.AMO_CLIENT_ID;
         this.clientSecret = process.env.AMO_CLIENT_SECRET;
         this.redirectUri = process.env.AMO_REDIRECT_URI;
-        this.refreshToken = process.env.AMO_REFRESH_TOKEN;
+        this.authCode = process.env.AMO_AUTH_CODE;
         this.tokenPath = path.join(__dirname, 'token.json');
 
-        // Проверяем наличие долгосрочного токена
-        if (!this.refreshToken) {
-            console.error('ВНИМАНИЕ: Не указан долгосрочный токен AMO_REFRESH_TOKEN в .env файле');
+        // Интервал обновления токена в миллисекундах (каждые 12 часов)
+        this.tokenRefreshInterval = 12 * 60 * 60 * 1000;
+
+        // Запускаем инициализацию и планировщик обновления токена
+        this.initialize();
+    }
+
+    // Инициализация клиента
+    async initialize() {
+        try {
+            // Проверяем и обновляем токен при запуске
+            await this.checkAndRefreshToken();
+
+            // Устанавливаем интервал для регулярного обновления токена
+            setInterval(() => {
+                this.checkAndRefreshToken();
+            }, this.tokenRefreshInterval);
+
+            console.log(`Планировщик обновления токенов запущен (интервал: ${this.tokenRefreshInterval / (60 * 60 * 1000)} часов)`);
+        } catch (error) {
+            console.error('Ошибка инициализации AmoCRM клиента:', error.message);
         }
     }
 
-    async getAccessToken() {
+    // Метод для проверки и обновления токена если нужно
+    async checkAndRefreshToken() {
         try {
-            // Проверяем наличие токена в файле
-            if (fs.existsSync(this.tokenPath)) {
-                const tokenData = JSON.parse(fs.readFileSync(this.tokenPath));
+            let tokenData = null;
 
-                // Если токен действителен, используем его
-                if (tokenData.expires_at > Date.now()) {
-                    return tokenData.access_token;
+            // Проверяем наличие файла с токеном
+            if (fs.existsSync(this.tokenPath)) {
+                try {
+                    tokenData = JSON.parse(fs.readFileSync(this.tokenPath));
+                } catch (err) {
+                    console.error('Ошибка чтения файла токена:', err.message);
+                    tokenData = null;
                 }
             }
 
-            // Обновляем токен через refresh_token
-            if (!this.refreshToken) {
-                throw new Error('Отсутствует долгосрочный токен (refresh_token)');
+            // Если токен отсутствует или истекает в ближайший час
+            if (!tokenData || !tokenData.access_token || !tokenData.expires_at ||
+                tokenData.expires_at < Date.now() + 60 * 60 * 1000) {
+
+                console.log('Токен отсутствует или скоро истечет, получаем новый...');
+
+                // Если есть refresh_token, пробуем использовать его
+                if (tokenData && tokenData.refresh_token) {
+                    try {
+                        await this.refreshAccessToken(tokenData.refresh_token);
+                        return;
+                    } catch (error) {
+                        console.log('Не удалось обновить токен через refresh_token, пробуем код авторизации...');
+                    }
+                }
+
+                // Если обновление не удалось или нет refresh_token, используем код авторизации
+                if (this.authCode) {
+                    await this.getTokenByAuthCode();
+                } else {
+                    throw new Error('Отсутствует код авторизации и refresh_token истек');
+                }
+            } else {
+                const tokenExpiresIn = tokenData.expires_at - Date.now();
+                console.log(`Токен действителен еще ${Math.round(tokenExpiresIn / 3600000)} часов`);
             }
+        } catch (error) {
+            console.error('Ошибка при проверке/обновлении токена:', error.message);
+            throw error;
+        }
+    }
+
+    // Метод для обновления токена через refresh_token
+    async refreshAccessToken(refreshToken) {
+        try {
+            console.log('Обновление токена доступа через refresh_token...');
 
             const response = await axios.post(
                 `https://${this.domain}/oauth2/access_token`,
@@ -43,7 +96,7 @@ class AmoCRMClient {
                     client_id: this.clientId,
                     client_secret: this.clientSecret,
                     grant_type: 'refresh_token',
-                    refresh_token: this.refreshToken,
+                    refresh_token: refreshToken,
                     redirect_uri: this.redirectUri
                 }
             );
@@ -55,18 +108,132 @@ class AmoCRMClient {
                 expires_at: Date.now() + (response.data.expires_in * 1000)
             };
 
-            // Обновляем долгосрочный токен в памяти
-            this.refreshToken = response.data.refresh_token;
+            // Сохраняем токены в файл
+            fs.writeFileSync(this.tokenPath, JSON.stringify(tokenData));
+
+            console.log('Токен успешно обновлен и сохранен');
+            return tokenData.access_token;
+        } catch (error) {
+            console.error('Ошибка при обновлении токена:', error.message);
+            if (error.response?.data) {
+                console.error('Ответ от amoCRM:', JSON.stringify(error.response.data));
+            }
+            throw error;
+        }
+    }
+
+    // Метод для получения токена по коду авторизации
+    async getTokenByAuthCode() {
+        try {
+            console.log('Получение токена по коду авторизации...');
+
+            if (!this.authCode) {
+                throw new Error('Отсутствует код авторизации (AMO_AUTH_CODE) в .env файле');
+            }
+
+            const response = await axios.post(
+                `https://${this.domain}/oauth2/access_token`,
+                {
+                    client_id: this.clientId,
+                    client_secret: this.clientSecret,
+                    grant_type: 'authorization_code',
+                    code: this.authCode,
+                    redirect_uri: this.redirectUri
+                }
+            );
+
+            // Сохраняем новые токены
+            const tokenData = {
+                access_token: response.data.access_token,
+                refresh_token: response.data.refresh_token,
+                expires_at: Date.now() + (response.data.expires_in * 1000)
+            };
 
             // Сохраняем токены в файл
             fs.writeFileSync(this.tokenPath, JSON.stringify(tokenData));
 
+            // Очищаем код авторизации в .env файле, так как он больше не действителен
+            this.updateEnvFile(response.data.refresh_token);
+
+            // Обновляем код авторизации в памяти (устанавливаем в null, т.к. он уже использован)
+            this.authCode = null;
+
+            console.log('Токен успешно получен по коду авторизации и сохранен');
             return tokenData.access_token;
         } catch (error) {
-            console.error('Ошибка при получении токена:', error.message);
+            console.error('Ошибка при получении токена по коду авторизации:', error.message);
             if (error.response?.data) {
                 console.error('Ответ от amoCRM:', JSON.stringify(error.response.data));
             }
+            throw new Error('Не удалось получить токен по коду авторизации. Возможно, код истек. Получите новый код авторизации в интерфейсе amoCRM');
+        }
+    }
+
+    // Метод для обновления .env файла - сохранение refresh_token и удаление кода авторизации
+    updateEnvFile(newRefreshToken) {
+        try {
+            const envPath = path.join(__dirname, '.env');
+
+            // Проверяем существование файла .env
+            if (!fs.existsSync(envPath)) {
+                console.error('Файл .env не найден, пропускаем обновление');
+                return;
+            }
+
+            // Читаем содержимое файла .env
+            let envContent = fs.readFileSync(envPath, 'utf8');
+
+            // Обновляем значение AMO_REFRESH_TOKEN
+            const refreshTokenRegex = /AMO_REFRESH_TOKEN=(.+)(\n|$)/;
+
+            if (refreshTokenRegex.test(envContent)) {
+                // Заменяем существующее значение
+                envContent = envContent.replace(refreshTokenRegex, `AMO_REFRESH_TOKEN=${newRefreshToken}$2`);
+            } else {
+                // Добавляем новое значение
+                envContent += `\nAMO_REFRESH_TOKEN=${newRefreshToken}\n`;
+            }
+
+            // Комментируем код авторизации, так как он уже использован
+            const authCodeRegex = /(AMO_AUTH_CODE=)(.+)(\n|$)/;
+            if (authCodeRegex.test(envContent)) {
+                envContent = envContent.replace(authCodeRegex, `# $1$2$3`);
+            }
+
+            // Записываем обновленное содержимое в файл
+            fs.writeFileSync(envPath, envContent);
+            console.log('Файл .env успешно обновлен');
+        } catch (error) {
+            console.error('Ошибка при обновлении .env файла:', error.message);
+        }
+    }
+
+    // Метод для получения действующего токена доступа
+    async getAccessToken() {
+        try {
+            // Проверяем наличие токена в файле
+            if (fs.existsSync(this.tokenPath)) {
+                try {
+                    const tokenData = JSON.parse(fs.readFileSync(this.tokenPath));
+
+                    // Если токен действителен еще как минимум 5 минут, используем его
+                    if (tokenData.access_token && tokenData.expires_at &&
+                        tokenData.expires_at > Date.now() + 5 * 60 * 1000) {
+                        return tokenData.access_token;
+                    }
+                } catch (err) {
+                    console.error('Ошибка при чтении файла токена:', err.message);
+                }
+            }
+
+            // Если токен отсутствует или истекает, обновляем его
+            await this.checkAndRefreshToken();
+
+            // Читаем обновленный токен
+            const tokenData = JSON.parse(fs.readFileSync(this.tokenPath));
+            return tokenData.access_token;
+        } catch (error) {
+            console.error('Ошибка при получении токена доступа:', error.message);
             throw new Error('Не удалось получить токен доступа');
         }
     }
@@ -89,8 +256,28 @@ class AmoCRMClient {
             }
 
             console.log(`Запрос: ${method.toUpperCase()} ${url}`);
-            const response = await axios(config);
-            return response.data;
+
+            try {
+                const response = await axios(config);
+                return response.data;
+            } catch (error) {
+                // Проверяем, не связана ли ошибка с истекшим токеном
+                if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+                    console.log(`Получен ответ ${error.response.status}, обновляем токен и повторяем запрос...`);
+
+                    // Принудительно обновляем токен
+                    await this.checkAndRefreshToken();
+
+                    // Обновляем токен в запросе
+                    config.headers['Authorization'] = `Bearer ${await this.getAccessToken()}`;
+
+                    // Повторяем запрос с новым токеном
+                    const retryResponse = await axios(config);
+                    return retryResponse.data;
+                }
+
+                throw error;
+            }
         } catch (error) {
             console.error(`Ошибка запроса к amoCRM (${method} ${url}):`, error.message);
             if (error.response?.data) {
@@ -99,6 +286,9 @@ class AmoCRMClient {
             throw error;
         }
     }
+
+    // Все остальные методы (createContact, getPipelineByCity, createLead, addNoteToLead, createLeadWithContact)
+    // оставляем без изменений
 
     // Создание контакта
     async createContact(name, phone) {
